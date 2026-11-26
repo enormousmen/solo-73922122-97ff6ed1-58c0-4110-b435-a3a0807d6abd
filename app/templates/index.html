@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git 回归定位台 · Parallel Bisect</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⑂</span>
+    <div>
+      <h1>Git 回归定位台</h1>
+      <p class="subtitle">内置合并历史 · 双槽并行实测 · 推导 / 冲突 / 最早失败候选</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="health" class="health" data-testid="health">检查服务中…</span>
+    <button id="new-round-btn" class="btn ghost hidden" data-testid="new-round">发起新一轮</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ============== left: setup + graph ============== -->
+  <section class="col-main">
+    <div class="card setup-card">
+      <h2>1. 选择定位区间</h2>
+      <div id="presets" class="presets" data-testid="presets"></div>
+
+      <div class="select-row">
+        <label class="field">
+          <span class="field-label"><i class="dot known-bad"></i>已知失败提交（端点）</span>
+          <select id="bad-select" data-testid="bad-select"></select>
+        </label>
+        <span class="arrow">← 后代 / 祖先 →</span>
+        <label class="field">
+          <span class="field-label"><i class="dot known-good"></i>已通过的祖先</span>
+          <select id="good-select" data-testid="good-select"></select>
+        </label>
+        <button id="start-btn" class="btn primary" data-testid="start-btn">▶ 启动测试</button>
+      </div>
+      <div id="form-error" class="form-error hidden" data-testid="form-error"></div>
+      <p class="rule-hint">
+        规则：最多同时跑 <b>2</b> 个实测，每个任务用 <code>git archive &lt;sha&gt;</code>
+        解出<b>该提交自己的文件</b>再跑 QA；有空位就补测“未尝试且推不出结果”的提交。
+        <b class="t-pass">通过 ⇒ 祖先通过</b>，<b class="t-fail">失败 ⇒ 后代失败</b>，
+        <b class="t-skip">跳过 = 未知</b>。
+      </p>
+    </div>
+
+    <div class="card graph-card">
+      <div class="card-head">
+        <h2>2. 内置合并历史与实时状态</h2>
+        <div class="legend" data-testid="legend">
+          <span><i class="dot known-bad"></i>已知/实测失败</span>
+          <span><i class="dot known-good"></i>已知/实测通过</span>
+          <span><i class="dot deduced-fail"></i>推导失败</span>
+          <span><i class="dot deduced-pass"></i>推导通过</span>
+          <span><i class="dot running"></i>实测中</span>
+          <span><i class="dot skip"></i>跳过/未知</span>
+          <span><i class="dot candidate"></i>最早失败候选</span>
+          <span><i class="dot conflict"></i>冲突提交</span>
+        </div>
+      </div>
+      <div id="graph" class="graph" data-testid="graph">
+        <div class="loading">正在读取内置 Git 历史…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== right: live results ============== -->
+  <aside class="col-side">
+    <div class="card status-card">
+      <h2>本轮状态</h2>
+      <div id="session-status" class="session-status" data-testid="session-status">
+        <span class="status-pill idle">尚未启动</span>
+      </div>
+      <div id="draining-note" class="draining hidden" data-testid="draining-note">
+        ⚠ 已发现冲突事实，正在等待已开跑的测试完成实测并计入结论…
+      </div>
+
+      <div class="slots" data-testid="slots">
+        <div class="slot-title">测试槽位 <b id="slot-count">0 / 2</b></div>
+        <div id="active-jobs" class="active-jobs"></div>
+      </div>
+
+      <div class="stats-grid" id="stats-grid" data-testid="stats-grid">
+        <div class="stat"><b id="stat-tested">–</b><span>已实测</span></div>
+        <div class="stat p"><b id="stat-pass">–</b><span>实测通过</span></div>
+        <div class="stat f"><b id="stat-fail">–</b><span>实测失败</span></div>
+        <div class="stat s"><b id="stat-skip">–</b><span>跳过/出错</span></div>
+        <div class="stat dp"><b id="stat-dpass">–</b><span>推导通过</span></div>
+        <div class="stat df"><b id="stat-dfail">–</b><span>推导失败</span></div>
+      </div>
+    </div>
+
+    <div id="conflict-panel" class="card conflict-card hidden" data-testid="conflict-panel">
+      <h2>⛔ 结果冲突，本轮以冲突结束</h2>
+      <p class="conflict-intro">
+        以下事实对满足“祖先是<b class="t-fail">失败</b>提交、后代却是<b class="t-pass">通过</b>提交”，
+        说明历史不满足单调假设（存在修复后再次回归等情况）。
+      </p>
+      <div id="conflict-list" class="conflict-list"></div>
+    </div>
+
+    <div class="card candidates-card" data-testid="candidates-card">
+      <h2>所有可能的最早失败提交</h2>
+      <p class="candidate-hint">范围＝失败端点及其全部祖先；排除已知/推导通过，以及存在失败祖先的提交。</p>
+      <div id="candidates" class="candidates" data-testid="candidates">
+        <div class="empty">启动后在这里列出候选。</div>
+      </div>
+    </div>
+
+    <div class="card events-card">
+      <h2>调度与结论日志</h2>
+      <div id="events" class="events" data-testid="events"></div>
+    </div>
+  </aside>
+</main>
+
+<footer class="footer">
+  Flask · 内存轮次状态 · 每任务独立 <code>git archive</code> 临时工作目录 · Docker Compose 启动
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+.git
+.gitignore
+.runtime
+.pytest_cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+tests/
+.pydeps/
+node_modules/

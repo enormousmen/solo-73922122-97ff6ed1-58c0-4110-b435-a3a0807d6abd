@@ -1,0 +1,32 @@
+services:
+  web:
+    build: .
+    image: gsb-git-bisect-page:latest
+    container_name: gsb-git-bisect
+    # Publish the Flask-standard port 5000, the common 8000 and 8080;
+    # the container listens on both 5000 and 8000.
+    ports:
+      - "5000:5000"
+      - "8000:8000"
+      - "8080:8000"
+    environment:
+      HISTORY_REPO: /data/history-repo
+      WORK_ROOT: /tmp/gsb-bisect/work
+      # Simulated QA duration range (seconds) so the two-slot scheduling and
+      # live status are observable in the UI. Override on the host, e.g.
+      # TEST_DELAY_MIN=0 TEST_DELAY_MAX=0 docker compose up
+      TEST_DELAY_MIN: "${TEST_DELAY_MIN:-0.5}"
+      TEST_DELAY_MAX: "${TEST_DELAY_MAX:-1.4}"
+    volumes:
+      - history-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=4).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  history-data:
