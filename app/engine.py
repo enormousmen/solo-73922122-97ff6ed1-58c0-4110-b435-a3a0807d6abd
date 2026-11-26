@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Set
 
 from .graph import CommitGraph
+from .scheduler import SlotRequest, SlotScheduler
 
 PASS = "pass"
 FAIL = "fail"
@@ -233,6 +234,8 @@ class BisectSession:
         *,
         concurrency: int = CONCURRENCY,
         executor: Optional[Executor] = None,
+        scheduler: Optional[SlotScheduler] = None,
+        slot_scheduler: Optional[SlotScheduler] = None,
         clock: Callable[[], float] = time.time,
         sid: Optional[str] = None,
     ):
@@ -243,12 +246,20 @@ class BisectSession:
         self.runner = runner
         self.concurrency = concurrency
         self.executor = executor or ThreadExecutor()
+        # By default each round gets a private pool, which keeps deterministic
+        # single-session tests unchanged.  The web server injects ONE shared
+        # two-slot scheduler so the whole site runs at most two real tests.
+        self.scheduler = scheduler or slot_scheduler or SlotScheduler(slots=concurrency)
         self.clock = clock
 
         self.lock = threading.RLock()
         self.facts: Dict[str, Fact] = {}
         self.jobs: Dict[str, List[Job]] = {}
         self.inflight: Set[str] = set()
+        # Commits we want to test but which have not yet been granted a real
+        # site slot.  They are NOT displayed as running/testing.
+        self.queued: Set[str] = set()
+        self.requests: Dict[str, SlotRequest] = {}
         self.status = "running"  # running | complete | conflict
         self.draining = False
         self.conflicts: List[dict] = []
@@ -284,29 +295,178 @@ class BisectSession:
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> "BisectSession":
-        launches = self._plan_and_mark()
-        for sha in launches:
-            self.executor.submit(self._make_worker(sha))
+        self._kick()
         return self
 
-    def _plan_and_mark(self) -> List[str]:
-        """Fill free slots. Must be called with self.lock held conceptually;
-        acquires the lock itself and marks jobs running before returning."""
-        launches: List[str] = []
+    # ----------------------------------------------------- slot scheduling
+    def _kick(self) -> None:
+        """Plan wanted commits, reserve site slots, admit and launch them.
+
+        Must be safe to call after every state transition and from any
+        thread: all planning/admission is synchronised by ``self.lock`` and
+        the outstanding set (inflight + queued) makes repeated kicks
+        idempotent.
+        """
+        for _ in range(256):  # bounded stale-grant replenishment chains
+            with self.lock:
+                reqs = self._plan_locked()
+            if not reqs:
+                with self.lock:
+                    self._finish_if_done_locked()
+                return
+
+            granted = self.scheduler.submit(reqs)
+            if not granted:
+                # Every new request is waiting in the site FIFO; a later
+                # slot release calls _grant_request automatically.
+                return
+
+            with self.lock:
+                accepted, rejected = self._admit_batch_locked(granted)
+            for req in accepted:
+                self._launch(req)
+            for req in rejected:
+                # The reserved slot was not used: return it to the site pool
+                # and let the scheduler hand it to the next FIFO waiter.
+                self.scheduler.release(req)
+
+            if not rejected:
+                with self.lock:
+                    self._finish_if_done_locked()
+                return
+            # Some immediately reserved grants were stale; loop and replenish.
+
+    def _plan_locked(self) -> List[SlotRequest]:
+        """Create auto requests until outstanding == concurrency or no choice."""
+        reqs: List[SlotRequest] = []
+        if self.status != "running" or self.draining:
+            return reqs
+        outstanding: Set[str] = set(self.inflight) | set(self.queued)
+        while len(outstanding) < self.concurrency:
+            sha = choose_next(self.graph, self.bad, self.facts, outstanding)
+            if sha is None:
+                break
+            req = SlotRequest(self, sha, "auto")
+            req.enqueued_at = self.clock()
+            self.queued.add(sha)
+            self.requests[sha] = req
+            outstanding.add(sha)
+            reqs.append(req)
+        return reqs
+
+    def _admit_batch_locked(
+        self, granted: Sequence[SlotRequest]
+    ) -> tuple[List[SlotRequest], List[SlotRequest]]:
+        accepted: List[SlotRequest] = []
+        rejected: List[SlotRequest] = []
+        for req in granted:
+            if self._admit_locked(req):
+                accepted.append(req)
+            else:
+                rejected.append(req)
+        return accepted, rejected
+
+    def _admit_locked(self, req: SlotRequest) -> bool:
+        """Revalidate a slot grant against the round's newest facts.
+
+        This is the exact "got the slot and is permitted to execute" moment:
+        only here is the Job created and the commit marked running.
+        """
+        sha = req.sha
+        if req.cancelled or self.requests.get(sha) is not req or sha not in self.queued:
+            return False
+        if self.status != "running" or self.draining:
+            self._discard_request_locked(req)
+            return False
+        if sha in self.inflight:
+            self._discard_request_locked(req)
+            return False
+
+        fact = self.facts.get(sha)
+        if req.kind == "auto":
+            if fact is not None:
+                self._reject_request_locked(req, "该提交已有结果，取消本次补测")
+                return False
+            pass_implies, fail_implies = implied_sets(self.graph, self.facts)
+            if sha in pass_implies or sha in fail_implies:
+                side = "通过" if sha in pass_implies else "失败"
+                self._reject_request_locked(
+                    req,
+                    f"槽位空出后按本轮最新结果复核：{self._short(sha)} "
+                    f"已可推断为{side}，无需再实测，自动跳过该补测",
+                )
+                return False
+        elif fact is not None and fact.kind not in (SKIP, ERROR):
+            # A fresh definitive fact appeared while a manual retry queued.
+            self._reject_request_locked(req, "该提交已有新的实测结果，取消重测")
+            return False
+
+        # Accepted: queued intent becomes a real running job.
+        self.queued.discard(sha)
+        job = Job(sha=sha, number=next(self._job_seq), started_at=self.clock())
+        self.jobs.setdefault(sha, []).append(job)
+        self.inflight.add(sha)
+        self._event("info", f"拿到全站实测槽位，开始实测 {self._short(sha)}"
+                           f"（第 {job.number} 次）：将该提交的文件解出后运行 QA")
+        return True
+
+    def _discard_request_locked(self, req: SlotRequest) -> None:
+        self.queued.discard(req.sha)
+        if self.requests.get(req.sha) is req:
+            self.requests.pop(req.sha, None)
+
+    def _reject_request_locked(self, req: SlotRequest, message: str) -> None:
+        self._discard_request_locked(req)
+        self._event("info", message)
+
+    def _grant_request(self, req: SlotRequest) -> bool:
+        """Callback used by the shared scheduler on an asynchronous handoff."""
         with self.lock:
-            if self.status != "running" or self.draining:
-                return launches
-            while len(self.inflight) < self.concurrency:
-                sha = choose_next(self.graph, self.bad, self.facts, self.inflight)
-                if sha is None:
-                    break
-                self._mark_running(sha)
-                launches.append(sha)
-            if not self.inflight and not launches:
-                self._finish_if_done_locked()
-        return launches
+            ok = self._admit_locked(req)
+        if ok:
+            return self._launch(req)
+        # The grant was stale.  Replenish this round; the freshly planned
+        # request re-enters the site FIFO and the scheduler drain loop will
+        # hand out the freed slot to the next waiter.
+        self._kick()
+        return False
+
+    def _launch(self, req: SlotRequest) -> bool:
+        """Submit the worker; if the executor rejects it, fail the job so the
+        state machine and the site slot are always released."""
+        try:
+            self.executor.submit(self._make_worker(req.sha))
+            return True
+        except Exception as exc:  # pragma: no cover - depends on thread limits
+            self._event("danger",
+                        f"实测线程启动失败 {self._short(req.sha)}：{exc}")
+            try:
+                self.finish_job(req.sha, _ErrorResult(f"executor submit failed: {exc}"))
+            except Exception:  # pragma: no cover - last-resort unstick
+                with self.lock:
+                    self.inflight.discard(req.sha)
+                    self.requests.pop(req.sha, None)
+            return False
+
+    def _cancel_queued_locked(self) -> List[SlotRequest]:
+        dead: List[SlotRequest] = []
+        for sha in list(self.queued):
+            req = self.requests.pop(sha, None)
+            if req is not None:
+                dead.append(req)
+        self.queued.clear()
+        return dead
 
     def _mark_running(self, sha: str) -> Job:
+        """Directly mark a job running (test helper / legacy entry point).
+
+        Production scheduling goes through :meth:`_kick` /
+        :meth:`_grant_request`, which reserve a site slot first.  This helper
+        intentionally does not touch the scheduler so deterministic tests
+        that model pre-launched jobs keep working.
+        """
+        self.queued.discard(sha)
+        self.requests.pop(sha, None)
         job = Job(sha=sha, number=next(self._job_seq), started_at=self.clock())
         self.jobs.setdefault(sha, []).append(job)
         self.inflight.add(sha)
@@ -328,7 +488,8 @@ class BisectSession:
 
     def finish_job(self, sha: str, result) -> None:
         """Record a real test result and advance the state machine."""
-        spawn: List[str] = []
+        finished_req: Optional[SlotRequest] = None
+        cancelled: List[SlotRequest] = []
         with self.lock:
             job_list = self.jobs.get(sha, [])
             job = next((j for j in reversed(job_list) if j.finished_at is None), None)
@@ -349,6 +510,11 @@ class BisectSession:
                 job.duration = duration
                 job.workdir = workdir
             self.inflight.discard(sha)
+            self.queued.discard(sha)
+            req = self.requests.pop(sha, None)
+            # Only scheduler-backed requests actually own a site slot.
+            if req is not None and req.slot_held:
+                finished_req = req
 
             attempt_no = len(self.jobs.get(sha, []))
             self.facts[sha] = Fact(
@@ -365,11 +531,15 @@ class BisectSession:
             # Conflict evaluation uses every known / measured fact.
             self.conflicts = find_conflicts(self.graph, self.facts)
             if self.conflicts:
+                # A conflict means no NEW test may start.  Queued requests
+                # never held a slot, so cancel them; inflight jobs are kept
+                # and will be counted as they finish.
+                cancelled = self._cancel_queued_locked()
                 if not self.draining:
                     self.draining = True
                     self._event("danger",
                                 "发现“祖先失败、后代通过”的冲突事实；"
-                                "停止补测，等待已开跑的测试实测完成后结束本轮")
+                                "停止启动新的补测，等待已开跑的测试实测完成后结束本轮")
                 if not self.inflight:
                     self.status = "conflict"
                     self.draining = False
@@ -379,22 +549,21 @@ class BisectSession:
                         for p in self.conflicts
                     )
                     self._event("danger", f"本轮以冲突结束：{pairs}")
-            else:
-                while len(self.inflight) < self.concurrency:
-                    nxt = choose_next(self.graph, self.bad, self.facts, self.inflight)
-                    if nxt is None:
-                        break
-                    self._mark_running(nxt)
-                    spawn.append(nxt)
-                self._finish_if_done_locked()
 
-        for nxt in spawn:
-            self.executor.submit(self._make_worker(nxt))
+        # All scheduler interaction happens outside the session lock to keep
+        # lock ordering one-directional.
+        if cancelled:
+            self.scheduler.cancel(cancelled)
+        if finished_req is not None:
+            # Release first so older global FIFO waiters from other rounds
+            # receive the free slot before this round tops itself up.
+            self.scheduler.release(finished_req)
+        self._kick()
 
     def _finish_if_done_locked(self) -> None:
         if self.status != "running":
             return
-        if self.inflight:
+        if self.inflight or self.queued:
             return
         if self.draining:
             self.status = "conflict"
@@ -412,8 +581,14 @@ class BisectSession:
 
     # ------------------------------------------------------------ manual retry
     def retry(self, sha: str) -> tuple[bool, str, List[str]]:
-        """Manually re-run a skipped / errored commit. Respects slot limit."""
-        spawn: List[str] = []
+        """Manually re-run a skipped / errored commit.
+
+        The request still goes through the site-wide two-slot scheduler and
+        will queue (instead of being rejected) when both slots are busy.
+        Manual requests are not dropped due to deduction: the engineer
+        explicitly asked for a fresh measurement.
+        """
+        req: Optional[SlotRequest] = None
         with self.lock:
             if self.status != "running" or self.draining:
                 return False, "本轮已经结束，不能再补测；请发起新一轮", []
@@ -424,19 +599,33 @@ class BisectSession:
                 return False, "只能手动重测曾跳过或出错的提交", []
             if sha in self.inflight:
                 return False, "该提交正在实测中", []
-            if len(self.inflight) >= self.concurrency:
-                return False, "两个测试槽位都在忙碌", []
+            if sha in self.queued:
+                return False, "该提交已在等待实测槽位", []
+            if len(self.inflight) + len(self.queued) >= self.concurrency:
+                return False, "本轮已有两个实测/排队任务，请等其中一个结束", []
             # Remove the old unknown fact while keeping job history.
             self.facts.pop(sha, None)
-            self._mark_running(sha)
-            spawn.append(sha)
-        for s in spawn:
-            self.executor.submit(self._make_worker(s))
-        return True, "已重新加入实测", spawn
+            req = SlotRequest(self, sha, "manual")
+            req.enqueued_at = self.clock()
+            self.queued.add(sha)
+            self.requests[sha] = req
 
+        granted = self.scheduler.submit([req])
+        if granted:
+            with self.lock:
+                accepted, rejected = self._admit_batch_locked(granted)
+            for r in accepted:
+                self._launch(r)
+            for r in rejected:
+                self.scheduler.release(r)
+            if rejected:
+                self._kick()
+        return True, "已加入实测调度：有空槽即自动开跑", [sha]
     # ------------------------------------------------------------ snapshot
     def snapshot(self) -> dict:
         now = self.clock()
+        pool = self.scheduler.stats()
+        global_positions = self.scheduler.positions()
         with self.lock:
             pass_implies, fail_implies = implied_sets(self.graph, self.facts)
             candidates = earliest_failure_candidates(self.graph, self.bad, self.facts)
@@ -447,11 +636,31 @@ class BisectSession:
                 conflict_shas.add(p["pass"])
 
             domain = self.graph.ancestors_incl(self.bad)
+
+            queued_reqs = sorted(
+                (r for sha, r in self.requests.items() if sha in self.queued),
+                key=lambda r: r.id,
+            )
+            queued_order = {r.sha: i + 1 for i, r in enumerate(queued_reqs)}
+            queued_jobs = [
+                {
+                    "sha": r.sha,
+                    "kind": r.kind,
+                    "manual": r.kind == "manual",
+                    "requested_at": r.enqueued_at,
+                    "waited": round(now - (r.enqueued_at or now), 2),
+                    "queue_position": i + 1,
+                    "session_position": i + 1,
+                    "global_position": global_positions.get(r.id),
+                }
+                for i, r in enumerate(queued_reqs)
+            ]
+
             nodes: Dict[str, dict] = {}
             for sha in self.graph.order:
                 nodes[sha] = self._node_json(
                     sha, now, domain, pass_implies, fail_implies,
-                    cand_set, conflict_shas,
+                    cand_set, conflict_shas, queued_order, global_positions,
                 )
 
             running_jobs = [
@@ -483,6 +692,8 @@ class BisectSession:
                 "deduced_fail": len(fail_implies - {s for s, f in self.facts.items()
                                                     if f.kind == FAIL}),
                 "candidates": len(candidates),
+                "queued": len(self.queued),
+                "waiting": len(self.queued),
             }
 
             return {
@@ -492,14 +703,32 @@ class BisectSession:
                 "status": self.status,
                 "draining": self.draining,
                 "concurrency": self.concurrency,
+                # active_count counts ONLY tests that actually hold a site
+                # slot and are executing; queued requests are separate.
                 "active_count": len(self.inflight),
                 "running_jobs": running_jobs,
+                # Queued / waiting aliases for API consumers.
+                "queued_jobs": queued_jobs,
+                "waiting_jobs": queued_jobs,
+                "queue": queued_jobs,
+                "queued_shas": [j["sha"] for j in queued_jobs],
+                "waiting_shas": [j["sha"] for j in queued_jobs],
+                "queued_count": len(queued_jobs),
+                "waiting_count": len(queued_jobs),
                 "jobs": all_jobs,
                 "counts": counts,
                 "nodes": nodes,
                 "candidates": candidates,
                 "conflicts": self.conflicts,
                 "conflict_shas": sorted(conflict_shas),
+                # Site-wide two-slot pool view (shared by every round).
+                "slot_pool": pool,
+                "site_slots": pool,
+                "global_slots": pool,
+                "site_active_count": pool["active"],
+                "global_active_count": pool["active"],
+                "site_waiting_count": pool["waiting"],
+                "global_waiting_count": pool["waiting"],
                 "events": list(self.events),
                 "created_at": self.created_at,
                 "finished_at": self.finished_at,
@@ -508,10 +737,12 @@ class BisectSession:
 
     def _node_json(
         self, sha, now, domain, pass_implies, fail_implies,
-        cand_set, conflict_shas,
+        cand_set, conflict_shas, queued_order=None, global_positions=None,
     ) -> dict:
         c = self.graph.commits[sha]
         fact = self.facts.get(sha)
+        is_queued = sha in self.queued
+        req = self.requests.get(sha)
         active_jobs = [j.to_json(now) for j in self.jobs.get(sha, [])
                        if j.finished_at is None]
         last_job = self.jobs.get(sha, [])[-1] if self.jobs.get(sha) else None
@@ -528,6 +759,9 @@ class BisectSession:
                 }.get(fact.kind, "unknown")
         elif sha in self.inflight or active_jobs:
             state = "running"
+        elif is_queued:
+            # Wanted by this round but not yet allowed onto a real slot.
+            state = "queued"
         elif sha in pass_implies and sha in fail_implies:
             state = "conflict-deduced"
         elif sha in fail_implies:
@@ -554,6 +788,15 @@ class BisectSession:
             "refs": c.refs,
             "in_range": sha in domain,
             "state": state,
+            # Queued/waiting aliases: state == "queued" as well as flags, so
+            # front-ends/tests can use whichever naming they already know.
+            "queued": is_queued,
+            "waiting": is_queued,
+            "scheduling_state": state if state in ("queued", "running") else "idle",
+            "queue_position": (queued_order or {}).get(sha),
+            "global_queue_position": (
+                (global_positions or {}).get(req.id) if req is not None else None
+            ),
             "is_candidate": sha in cand_set,
             "is_conflict": sha in conflict_shas,
             "deduced_from": deduced_from,

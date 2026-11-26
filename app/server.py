@@ -10,6 +10,7 @@ from .engine import BisectSession
 from .fixture import ensure_builtin_repo
 from .history import PRESETS, load_graph, validate_pair
 from .runner import GitArchiveRunner, GlobalSlotGate
+from .scheduler import SlotScheduler
 
 
 def create_app(test_config: Optional[dict] = None) -> Flask:
@@ -46,7 +47,15 @@ def create_app(test_config: Optional[dict] = None) -> Flask:
             delay_max=app.config["DELAY_MAX"],
         )
     # Process-wide guarantee: never more than two real tests at once.
+    # The shared FIFO scheduler is the authoritative admission point (it
+    # distinguishes "queued for a slot" from "actually running"); the
+    # GlobalSlotGate stays as a defence-in-depth hard cap inside the runner.
     runner = GlobalSlotGate(runner, slots=2)
+
+    scheduler = app.config.get("SCHEDULER") or app.config.get("SLOT_SCHEDULER")
+    if scheduler is None:
+        scheduler = SlotScheduler(slots=2)
+    app.config["SCHEDULER"] = scheduler
 
     sessions: Dict[str, BisectSession] = {}
 
@@ -57,7 +66,8 @@ def create_app(test_config: Optional[dict] = None) -> Flask:
 
     @app.get("/api/health")
     def health():
-        return jsonify(ok=True, sessions=len(sessions))
+        return jsonify(ok=True, sessions=len(sessions),
+                       slot_pool=scheduler.stats())
 
     @app.get("/api/history")
     def history():
@@ -77,7 +87,7 @@ def create_app(test_config: Optional[dict] = None) -> Flask:
         if err:
             return jsonify(error=err), 400
 
-        session = BisectSession(graph, bad, good, runner)
+        session = BisectSession(graph, bad, good, runner, scheduler=scheduler)
         sessions[session.id] = session
         session.start()
         return jsonify(session.snapshot()), 201

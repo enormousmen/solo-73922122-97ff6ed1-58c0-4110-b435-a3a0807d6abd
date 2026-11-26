@@ -42,10 +42,11 @@
       </div>
       <div id="form-error" class="form-error hidden" data-testid="form-error"></div>
       <p class="rule-hint">
-        规则：最多同时跑 <b>2</b> 个实测，每个任务用 <code>git archive &lt;sha&gt;</code>
-        解出<b>该提交自己的文件</b>再跑 QA；有空位就补测“未尝试且推不出结果”的提交。
+        规则：全站共用 <b>2</b> 个实测槽位，多个标签页发起的轮次一起排队；提交<b>真正拿到槽位并获准执行后才显示“实测中”</b>。
+        每个任务用 <code>git archive &lt;sha&gt;</code> 解出<b>该提交自己的文件</b>再跑 QA；
+        空槽自动补测“未尝试且推不出结果”的提交，开跑前会按本轮最新结果再次复核。
         <b class="t-pass">通过 ⇒ 祖先通过</b>，<b class="t-fail">失败 ⇒ 后代失败</b>，
-        <b class="t-skip">跳过 = 未知</b>。
+        <b class="t-skip">跳过 = 未知</b>。发现冲突后停止启动新测试，已开跑的测试仍跑完并计入结论。
       </p>
     </div>
 
@@ -58,6 +59,7 @@
           <span><i class="dot deduced-fail"></i>推导失败</span>
           <span><i class="dot deduced-pass"></i>推导通过</span>
           <span><i class="dot running"></i>实测中</span>
+          <span><i class="dot queued"></i>排队等槽位</span>
           <span><i class="dot skip"></i>跳过/未知</span>
           <span><i class="dot candidate"></i>最早失败候选</span>
           <span><i class="dot conflict"></i>冲突提交</span>
@@ -81,7 +83,9 @@
       </div>
 
       <div class="slots" data-testid="slots">
-        <div class="slot-title">测试槽位 <b id="slot-count">0 / 2</b></div>
+        <div class="slot-title">本轮占用槽位 <b id="slot-count">0 / 2</b>
+          <span id="pool-count" class="pool-count" data-testid="pool-count">全站实测槽位 – / 2</span>
+        </div>
         <div id="active-jobs" class="active-jobs"></div>
       </div>
 

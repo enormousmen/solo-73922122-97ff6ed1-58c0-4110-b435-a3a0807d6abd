@@ -12,6 +12,7 @@ const STATE_LABEL = {
   "deduced-fail": "推导失败",
   "deduced-pass": "推导通过",
   running: "实测中",
+  queued: "排队等槽位",
   skip: "跳过·未知",
   error: "出错·未知",
   pending: "待补测",
@@ -228,6 +229,7 @@ const STATE_HEX = {
   "deduced-fail": "#f0948b",
   "deduced-pass": "#7ac7a9",
   running: "#2e6be6",
+  queued: "#6941c6",
   skip: "#b54708",
   error: "#b54708",
   pending: "#98a2b3",
@@ -301,6 +303,11 @@ function drawLaneOverlay() {
           <animate attributeName="r" values="6;13;6" dur="1.2s" repeatCount="indefinite"/>
           <animate attributeName="opacity" values="0.8;0;0.8" dur="1.2s" repeatCount="indefinite"/>
         </circle>`;
+    } else if (state === "queued" || (node && node.queued)) {
+      dots += `<circle cx="${xc}" cy="${yc}" r="9" fill="none" stroke="${color}"
+          stroke-width="1.6" stroke-dasharray="3 3">
+          <animate attributeName="opacity" values="0.9;0.25;0.9" dur="1.6s" repeatCount="indefinite"/>
+        </circle>`;
     }
     dots += `<circle cx="${xc}" cy="${yc}" r="6" fill="${color}" stroke="#ffffff" stroke-width="2"/>`;
   });
@@ -335,9 +342,11 @@ function renderGraph() {
 
     let badges = "";
     if (n) {
-      badges += `<span class="badge ${state}">${
-        state === "running" ? '<span class="spinner"></span>' : ""
-      }${esc(STATE_LABEL[state] || state)}</span>`;
+      const icon = state === "running" ? '<span class="spinner"></span>'
+        : (state === "queued" ? '<span class="queue-icon">⏳</span>' : "");
+      badges += `<span class="badge ${state}"${n.queued ? ' data-queued="1"' : ""}>${icon}${
+        esc(STATE_LABEL[state] || state)
+      }${n.queued && n.global_queue_position ? ` · 全站第 ${n.global_queue_position} 位` : ""}</span>`;
       if (isCand) badges += `<span class="badge candidate-badge">可能最早失败</span>`;
       if (isConflict) badges += `<span class="badge conflict-badge">冲突提交</span>`;
     }
@@ -468,19 +477,28 @@ function renderStatus() {
     <span class="session-meta">${esc(session.id)} · 用时 ${session.elapsed}s</span>`;
   $("#draining-note").classList.toggle("hidden", !(session.draining));
   $("#slot-count").textContent = `${session.active_count} / ${session.concurrency}`;
+  const pool = session.slot_pool || {};
+  const poolEl = $("#pool-count");
+  if (poolEl) {
+    poolEl.textContent =
+      `全站实测槽位 ${pool.active ?? "–"} / ${pool.slots ?? 2}` +
+      (pool.waiting ? ` · 全站排队 ${pool.waiting} 个` : "");
+    poolEl.classList.toggle("busy", (pool.active || 0) >= (pool.slots || 2));
+  }
 }
 
 function renderActiveJobs() {
   const box = $("#active-jobs");
-  if (!session) { box.innerHTML = `<div class="no-job">启动后最多同时运行 2 项实测</div>`; return; }
-  if (!session.running_jobs.length) {
-    box.innerHTML = `<div class="no-job">当前没有运行中的实测（空位 ${session.concurrency}/${session.concurrency}）</div>`;
-    return;
-  }
-  box.innerHTML = session.running_jobs.map((j) => {
-    const c = bySha.get(j.sha);
-    const files = (j.read_files || []).map((f) => f.path).join(", ");
-    return `
+  if (!session) { box.innerHTML = `<div class="no-job">启动后最多同时运行 2 项实测（全站共用 2 个槽位）</div>`; return; }
+
+  const queued = session.queued_jobs || session.waiting_jobs || [];
+  let html = "";
+
+  if (session.running_jobs.length) {
+    html += session.running_jobs.map((j) => {
+      const c = bySha.get(j.sha);
+      const files = (j.read_files || []).map((f) => f.path).join(", ");
+      return `
       <div class="job-card" data-testid="active-job" data-sha="${j.sha}">
         <div class="jtop">
           <span class="spinner" style="width:11px;height:11px;border:2px solid var(--run);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span>
@@ -488,10 +506,39 @@ function renderActiveJobs() {
           <span>${esc(c ? c.subject : "")}</span>
           <span class="jelapsed">${j.elapsed}s</span>
         </div>
-        <div class="jfiles">正在解出 ${esc(j.sha)} 的文件并执行 qa/run_check.py… 独立临时目录</div>
+        <div class="jfiles">已拿到槽位，正在解出 ${esc(j.sha)} 的文件并执行 qa/run_check.py… 独立临时目录</div>
         ${files ? `<div class="jfiles">已读取：${esc(files)}</div>` : ""}
       </div>`;
-  }).join("");
+    }).join("");
+  }
+
+  if (queued.length) {
+    html += queued.map((j) => {
+      const c = bySha.get(j.sha);
+      return `
+      <div class="job-card queued" data-testid="queued-job" data-sha="${j.sha}">
+        <div class="jtop">
+          <span class="queue-icon">⏳</span>
+          <span class="jsha">${esc(short(j.sha))}</span>
+          <span>${esc(c ? c.subject : "")}</span>
+          <span class="jwait">排队第 ${j.queue_position || "?"} 位${
+            j.global_position ? ` · 全站第 ${j.global_position} 位` : ""
+          } · 已等 ${j.waited ?? 0}s</span>
+        </div>
+        <div class="jfiles">等待全站空槽，尚未开始实测；开跑前会按本轮最新结果复核，若已可推断则自动跳过。</div>
+      </div>`;
+    }).join("");
+  }
+
+  if (!html) {
+    const pool = session.slot_pool || {};
+    const siteBusy = (pool.active || 0) > session.active_count;
+    box.innerHTML = `<div class="no-job">当前没有运行中或排队的实测（本轮空位 ${
+      session.concurrency - session.active_count
+    }/${session.concurrency}${siteBusy ? "；另一轮正在使用全站槽位" : ""}）</div>`;
+    return;
+  }
+  box.innerHTML = html;
 }
 
 function renderStats() {
@@ -524,6 +571,8 @@ function renderCandidates() {
       reason = "该提交实测出错（按未知处理），仍可能是最早失败点，可展开后手动重测。";
     } else if (n.state === "running") {
       reason = "正在实测；在结果出来之前仍属于可能的最早失败提交。";
+    } else if (n.state === "queued" || n.queued) {
+      reason = "已在排队等全站实测槽位（尚未开始实测）；空槽后会先按最新结果复核，仍不可推断才开跑。";
     } else {
       reason = "尚无结果且无失败祖先，理论上仍可能是最早失败提交。";
     }
